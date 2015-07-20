@@ -19,7 +19,7 @@ package com.larskroll.fsdb;
 
 import com.larskroll.common.ByteArrayFormatter;
 import com.larskroll.common.ByteArrayRef;
-import com.larskroll.fsdb.FileSystemDB.FileRef;
+import com.larskroll.common.RAFileRef;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.file.Files;
@@ -78,7 +78,7 @@ public class DBTest {
 
         // GET
         for (int i = 0; i < NUM; i++) {
-            FileRef val = fsdb.get(keys.get(i).array(), 0);
+            RAFileRef val = fsdb.get(keys.get(i).array(), 0);
             assertNotNull(val);
             ByteBuffer valV = ByteBuffer.wrap(val.dereference());
             System.out.println("expected:\n     " + ByteArrayFormatter.printFormat(keys.get(i).array()));
@@ -91,6 +91,12 @@ public class DBTest {
         for (int i = 0; i < NUM; i++) {
             fsdb.delete(keys.get(i).array(), 0); // this is eventual, so can't really test it
         }
+        
+        // NullWrite
+        fsdb.put(keys.get(0).array(), ByteArrayRef.wrap(new byte[0]), 1);
+        RAFileRef val = fsdb.get(keys.get(0).array(), 1);
+        assertEquals(0, val.size());
+        assertEquals(0, val.dereference().length);
     }
 
     @After

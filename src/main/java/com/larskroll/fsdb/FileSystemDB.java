@@ -23,6 +23,7 @@ import com.larskroll.common.ByteArrayFormatter;
 import com.larskroll.common.DataRef;
 import com.larskroll.common.LRUCache;
 import com.larskroll.common.LRUCache.EvictionHandler;
+import com.larskroll.common.RAFileRef;
 import java.io.Closeable;
 import java.io.File;
 import java.io.FileFilter;
@@ -41,6 +42,7 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.TreeMap;
+import org.javatuples.Pair;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,7 +57,7 @@ public class FileSystemDB implements Closeable {
 
     private final Configuration config;
     private final File dbFolder;
-    private final LRUCache<File, FileRef> cache;
+    private final LRUCache<File, RAFileRef> cache;
     private final LRUCache<Byte, File> subdirs;
 
     public FileSystemDB(Configuration config) throws FSDBException {
@@ -65,9 +67,9 @@ public class FileSystemDB implements Closeable {
             throw new FSDBException("FSDB doesn't have sufficient rights to write in " + dbFolder.getAbsolutePath());
         }
         LOG.info("Started on {}", dbFolder);
-        cache = new LRUCache<File, FileRef>(config.cacheSize, new EvictionHandler<File, FileRef>() {
+        cache = new LRUCache<File, RAFileRef>(config.cacheSize, new EvictionHandler<File, RAFileRef>() {
 
-            public void evicted(Map.Entry<File, FileRef> entry) {
+            public void evicted(Map.Entry<File, RAFileRef> entry) {
                 entry.getValue().release();
             }
         });
@@ -75,20 +77,24 @@ public class FileSystemDB implements Closeable {
     }
 
     public void put(byte[] key, DataRef value, int version) {
-        FileRef fr = null;
+        RAFileRef fr = null;
         try {
             File f = key2File(key, version);
             ensureExists(f, key);
             //LOG.trace("Starting PUT into {}", f);
             fr = ref4File(f);
-            fr.raf.setLength(value.size());
-            fr.raf.seek(0);
+            RandomAccessFile raf = fr.getRAF();
+            raf.setLength(value.size());
+            raf.seek(0);
+            if (value.size() <= 0) {
+                return; // no reason to write nothing^^
+            }
             if (value.size() < Integer.MAX_VALUE) { // can buffer through byte[]
-                fr.raf.write(value.dereference());
-            } else if (value instanceof FileRef) { // too big for byte array but can do OS level file2file transfer
-                FileRef src = (FileRef) value;
-                FileChannel sink = fr.raf.getChannel();
-                FileChannel source = src.raf.getChannel();
+                raf.write(value.dereference());
+            } else if (value instanceof RAFileRef) { // too big for byte array but can do OS level file2file transfer
+                RAFileRef src = (RAFileRef) value;
+                FileChannel sink = raf.getChannel();
+                FileChannel source = src.getRAF().getChannel();
                 source.transferTo(0, src.size(), sink);
             } else { // too big for single byte array must buffer partial ranges...this not very efficient
                 byte[] buffer;
@@ -97,11 +103,11 @@ public class FileSystemDB implements Closeable {
                 for (long i = 0; i < num; i++) {
                     long start = i * Integer.MAX_VALUE;
                     long end = start + Integer.MAX_VALUE;
-                    fr.raf.write(value.dereference(start, end));
+                    raf.write(value.dereference(start, end));
                 }
                 long start = num * Integer.MAX_VALUE;
                 long end = start + rest;
-                fr.raf.write(value.dereference(start, end));
+                raf.write(value.dereference(start, end));
             }
         } catch (IOException ex) {
             LOG.error("Could not perform PUT operation: ", ex);
@@ -112,8 +118,8 @@ public class FileSystemDB implements Closeable {
         }
     }
 
-    public SortedMap<Integer, FileRef> get(byte[] key) {
-        SortedMap<Integer, FileRef> data = new TreeMap<Integer, FileRef>();
+    public SortedMap<Integer, RAFileRef> get(byte[] key) {
+        SortedMap<Integer, RAFileRef> data = new TreeMap<Integer, RAFileRef>();
         try {
             SortedMap<Integer, File> versions = key2Files(key);
 
@@ -124,7 +130,7 @@ public class FileSystemDB implements Closeable {
         return data;
     }
 
-    public FileRef get(byte[] key, int version) {
+    public RAFileRef get(byte[] key, int version) {
         try {
             SortedMap<Integer, File> versions = key2Files(key);
             //LOG.trace("Found {} version for key {}", versions.size(), key);
@@ -135,25 +141,25 @@ public class FileSystemDB implements Closeable {
         return null;
     }
 
-    public FileRef getCurrent(byte[] key) {
+    public Pair<Integer, RAFileRef> getCurrent(byte[] key) {
         try {
             SortedMap<Integer, File> versions = key2Files(key);
             return getCurrent(versions);
         } catch (IOException ex) {
             LOG.error("Could not perform GET operation: ", ex);
         }
-        return null;
+        return Pair.with(0, null);
     }
 
     public void delete(byte[] key, int version) {
-        FileRef fr = get(key, version);
+        RAFileRef fr = get(key, version);
         if (fr == null) {
             return;
         }
         try {
-            fr.raf.setLength(0);
+            fr.getRAF().setLength(0);
             fr.markForDeletion();
-            if (cache.remove(fr.f) != null) {
+            if (cache.remove(fr.getFile()) != null) {
                 fr.release(); // balance the cache retain
             }
             fr.release(); // balance out the original value
@@ -163,15 +169,15 @@ public class FileSystemDB implements Closeable {
     }
 
     public void delete(byte[] key) {
-        SortedMap<Integer, FileRef> refs = get(key);
+        SortedMap<Integer, RAFileRef> refs = get(key);
         if (refs.isEmpty()) {
             return;
         }
         try {
-            for (FileRef fr : refs.values()) {
-                fr.raf.setLength(0);
+            for (RAFileRef fr : refs.values()) {
+                fr.getRAF().setLength(0);
                 fr.markForDeletion();
-                if (cache.remove(fr.f) != null) {
+                if (cache.remove(fr.getFile()) != null) {
                     fr.release(); // balance the cache retain
                 }
                 fr.release(); // balance out the original value
@@ -220,7 +226,7 @@ public class FileSystemDB implements Closeable {
     }
 
     public void close() {
-        for (FileRef fr : cache.values()) {
+        for (RAFileRef fr : cache.values()) {
             fr.release();
         }
         cache.clear();
@@ -228,17 +234,17 @@ public class FileSystemDB implements Closeable {
         LOG.info("Closed database at {}", this.dbFolder);
     }
 
-    private void get(SortedMap<Integer, File> versions, SortedMap<Integer, FileRef> data) throws FileNotFoundException {
+    private void get(SortedMap<Integer, File> versions, SortedMap<Integer, RAFileRef> data) throws FileNotFoundException {
         for (Entry<Integer, File> e : versions.entrySet()) {
-            FileRef fr = ref4File(e.getValue());
+            RAFileRef fr = ref4File(e.getValue());
             data.put(e.getKey(), fr);
         }
     }
 
-    private FileRef get(SortedMap<Integer, File> versions, int version) throws FileNotFoundException {
+    private RAFileRef get(SortedMap<Integer, File> versions, int version) throws FileNotFoundException {
         File f = versions.get(version);
         if (f != null) {
-            FileRef fr = ref4File(f);
+            RAFileRef fr = ref4File(f);
             return fr;
         } else {
             //LOG.trace("No version {}", version);
@@ -246,20 +252,20 @@ public class FileSystemDB implements Closeable {
         return null;
     }
 
-    private FileRef getCurrent(SortedMap<Integer, File> versions) throws FileNotFoundException {
+    private Pair<Integer, RAFileRef> getCurrent(SortedMap<Integer, File> versions) throws FileNotFoundException {
         if (!versions.isEmpty()) {
             File f = versions.get(versions.lastKey());
-            FileRef fr = ref4File(f);
-            return fr;
+            RAFileRef fr = ref4File(f);
+            return Pair.with(versions.lastKey(), fr);
         }
-        return null;
+        return Pair.with(0, null);
     }
 
-    private FileRef ref4File(File f) throws FileNotFoundException {
-        FileRef fr = cache.get(f);
+    private RAFileRef ref4File(File f) throws FileNotFoundException {
+        RAFileRef fr = cache.get(f);
         if (fr == null) {
             RandomAccessFile raf = new RandomAccessFile(f, "rws");
-            fr = new FileRef(f, raf);
+            fr = new RAFileRef(f, raf);
             fr.retain(); // this one is for the cache
             cache.put(f, fr);
         } else {
@@ -344,8 +350,8 @@ public class FileSystemDB implements Closeable {
             return (SortedSet<Integer>) versions.keySet();
         }
 
-        public SortedMap<Integer, FileRef> getValues() {
-            SortedMap<Integer, FileRef> data = new TreeMap<Integer, FileRef>();
+        public SortedMap<Integer, RAFileRef> getValues() {
+            SortedMap<Integer, RAFileRef> data = new TreeMap<Integer, RAFileRef>();
             try {
                 get(versions, data);
             } catch (FileNotFoundException ex) {
@@ -354,7 +360,7 @@ public class FileSystemDB implements Closeable {
             return data;
         }
 
-        public FileRef getValue(int version) {
+        public RAFileRef getValue(int version) {
             try {
                 return get(versions, version);
             } catch (FileNotFoundException ex) {
@@ -363,9 +369,9 @@ public class FileSystemDB implements Closeable {
             return null;
         }
 
-        public FileRef getCurrentValue() {
+        public RAFileRef getCurrentValue() {
             try {
-                return getCurrent(versions);
+                return getCurrent(versions).getValue1();
             } catch (FileNotFoundException ex) {
                 LOG.error("Could not perform GET operation: ", ex);
             }
@@ -377,173 +383,4 @@ public class FileSystemDB implements Closeable {
         }
     }
 
-    public class FileRef implements DataRef {
-
-        private final RandomAccessFile raf;
-        private final File f;
-        private int rc = 1;
-        private boolean delete = false;
-
-        FileRef(File f, RandomAccessFile raf) {
-            this.f = f;
-            this.raf = raf;
-        }
-
-        void markForDeletion() {
-            this.delete = true;
-            //f.deleteOnExit(); // in case the VM quits 
-        }
-
-        public byte[] dereference() {
-            try {
-                byte[] data = new byte[(int) raf.length()];
-                raf.seek(0);
-                raf.read(data);
-                return data;
-            } catch (IOException ex) {
-                throw new RuntimeException(ex);
-            }
-        }
-
-        public byte dereference(long i) {
-            try {
-                if (i >= raf.length()) {
-                    throw new IndexOutOfBoundsException("Asked for index " + i + " but length is only " + raf.length());
-                }
-                raf.seek(i);
-                return raf.readByte();
-            } catch (IOException ex) {
-                throw new RuntimeException(ex);
-            }
-        }
-
-        public byte[] dereference(long start, long end) {
-            try {
-                if ((start >= raf.length()) || (start < 0)) {
-                    throw new IndexOutOfBoundsException("Asked for start " + start + " but length is only " + raf.length());
-                }
-                if ((end > raf.length()) || (end < start)) {
-                    throw new IndexOutOfBoundsException("Asked for end " + end + " but length is only " + raf.length() + " and start is" + start);
-                }
-                long l = end - start;
-                if (l > Integer.MAX_VALUE) {
-                    throw new IndexOutOfBoundsException("Range doesn't fit into an integer: " + l);
-                }
-                int li = (int) l;
-                byte[] data = new byte[li];
-                raf.seek(start);
-                raf.read(data);
-                return data;
-            } catch (IOException ex) {
-                throw new RuntimeException(ex);
-            }
-        }
-
-        public void assign(long i, byte val) {
-            try {
-                if (i >= raf.length()) {
-                    throw new IndexOutOfBoundsException("Asked for index " + i + " but length is only " + raf.length());
-                }
-                raf.seek(i);
-                raf.writeByte(val);
-            } catch (IOException ex) {
-                throw new RuntimeException(ex);
-            }
-        }
-
-        public void assign(long start, byte[] newData) {
-            try {
-                if ((start >= raf.length()) || (start < 0)) {
-                    throw new IndexOutOfBoundsException("Asked for start " + start + " but length is only " + raf.length());
-                }
-                long end = start + newData.length;
-                if ((end > raf.length())) {
-                    throw new IndexOutOfBoundsException("Asked for length " + newData.length + " but length is only " + raf.length());
-                }
-                raf.seek(start);
-                raf.write(newData);
-            } catch (IOException ex) {
-                throw new RuntimeException(ex);
-            }
-        }
-
-        public void assign(long start, DataRef newData) {
-            if (newData instanceof FileRef) {
-                try {
-                    FileRef src = (FileRef) newData;
-                    raf.seek(start);
-                    //src.raf.seek(0);
-                    FileChannel sink = raf.getChannel();
-                    FileChannel source = src.raf.getChannel();
-                    source.transferTo(0, src.raf.length(), sink);
-                } catch (IOException ex) {
-                    throw new RuntimeException(ex);
-                }
-            } else {
-                assign(start, newData.dereference());
-            }
-        }
-
-        public void copyTo(DataRef target, long offset) {
-            if (target instanceof FileRef) {
-                try {
-                    FileRef tgt = (FileRef) target;
-                    //tgt.raf.seek(offset);
-                    raf.seek(0);
-                    FileChannel sink = tgt.raf.getChannel();
-                    FileChannel source = raf.getChannel();
-                    source.transferTo(offset, raf.length(), sink);
-                } catch (IOException ex) {
-                    throw new RuntimeException(ex);
-                }
-            } else {
-                if (offset > Integer.MAX_VALUE) {
-                    throw new IndexOutOfBoundsException("offset doesn't fit into an integer: " + offset);
-                }
-                copyTo(target.dereference(), (int) offset);
-            }
-        }
-
-        public void copyTo(byte[] target, int offset) {
-            try {
-                if ((offset >= target.length) || (offset < 0)) {
-                    throw new IndexOutOfBoundsException("Asked for offset " + offset + " but length is only " + target.length);
-                }
-                raf.seek(0);
-                raf.read(target, offset, target.length - offset);
-            } catch (IOException ex) {
-                throw new RuntimeException(ex);
-            }
-        }
-
-        public long size() {
-            try {
-                return raf.length();
-            } catch (IOException ex) {
-                throw new RuntimeException(ex);
-            }
-        }
-
-        public void retain() {
-            rc++;
-        }
-
-        public void release() {
-            rc--;
-            if (rc == 0) {
-                try {
-                    raf.close();
-                    if (delete) {
-                        f.delete();
-                    }
-                } catch (IOException ex) {
-                    throw new RuntimeException(ex);
-                }
-            }
-            if (rc < 0) {
-                throw new IllegalStateException("Object was already deallocated: " + raf);
-            }
-        }
-
-    }
 }
